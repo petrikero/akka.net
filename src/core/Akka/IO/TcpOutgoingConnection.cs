@@ -77,10 +77,13 @@ namespace Akka.IO
             Socket.Blocking = true;
 
             var pipeBufferSize = ResolvePipeBufferSize(Settings, _connect.Options);
+            // The actor-side reader wakes inline on the read pump's thread. The writer keeps the thread-pool
+            // scheduler, so a read pump paused by backpressure resumes there, not inside the actor's AdvanceTo.
             var inputPipeOptions = new PipeOptions(
                 pauseWriterThreshold: pipeBufferSize * 2,
                 resumeWriterThreshold: pipeBufferSize,
                 minimumSegmentSize: Settings.MaxFrameSizeBytes,
+                readerScheduler: PipeScheduler.Inline,
                 useSynchronizationContext: false);
 
             return new TcpTransportConnection(Socket, inputPipeOptions, ResolveOutputPipeOptions(Settings, _connect.Options));
