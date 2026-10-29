@@ -65,6 +65,7 @@ internal sealed class ReceiveActorHandlers
         CanAddMoreHandlers();
 
         TypedHandlers.Add(CreateTypeHandler(shouldHandlePredicate, handler));
+        _handlersByType = null;
     }
 
     /// <param name="messageType">The message type the handler is registered for.</param>
@@ -80,6 +81,7 @@ internal sealed class ReceiveActorHandlers
         CanAddMoreHandlers();
 
         TypedHandlers.Add(CreateTypeHandler(messageType, shouldHandlePredicate, handler));
+        _handlersByType = null;
     }
 
     public void AddReceiveAnyHandler(Action<object> handler)
@@ -89,16 +91,44 @@ internal sealed class ReceiveActorHandlers
         HandleAny = handler;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    // Sets with at most this many handlers skip _handlersByType: scanning them costs about as much as the lookup,
+    // and they then allocate nothing per message type, which matters because every Become builds a new set.
+    internal const int MaxHandlersWithoutCache = 4;
+
+    // Per message type, the handlers whose type matches it, in registration order. Built on first use of each
+    // type, so a message is checked only against handlers that can take it. Only the owning actor's thread
+    // uses an instance, so no synchronization is needed.
+    private Dictionary<Type, ITypeHandler[]>? _handlersByType;
+
     public bool TryHandle(object message)
     {
         var messageType = message.GetType();
-        foreach (var handler in TypedHandlers)
+        if (TypedHandlers.Count <= MaxHandlersWithoutCache)
         {
-            if (!handler.TargetType.IsAssignableFrom(messageType)) continue;
-            if (handler.TryHandle(message))
+            foreach (var handler in TypedHandlers)
             {
-                return true;
+                if (!handler.TargetType.IsAssignableFrom(messageType)) continue;
+                if (handler.TryHandle(message))
+                {
+                    return true;
+                }
+            }
+        }
+        else
+        {
+            _handlersByType ??= new Dictionary<Type, ITypeHandler[]>();
+            if (!_handlersByType.TryGetValue(messageType, out var candidates))
+            {
+                candidates = TypedHandlers.FindAll(h => h.TargetType.IsAssignableFrom(messageType)).ToArray();
+                _handlersByType[messageType] = candidates;
+            }
+
+            foreach (var handler in candidates)
+            {
+                if (handler.TryHandle(message))
+                {
+                    return true;
+                }
             }
         }
 
