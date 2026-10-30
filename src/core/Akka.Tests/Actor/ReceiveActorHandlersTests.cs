@@ -6,6 +6,7 @@
 // -----------------------------------------------------------------------
 
 using System;
+using System.Collections.Generic;
 using Akka.Actor;
 using Xunit;
 
@@ -184,5 +185,103 @@ public class ReceiveActorHandlersTests
         // demonstrate the matcher ordering is preserved - interface handler should still be called
         Assert.True(setInterface);
         Assert.False(setBaz); // just a sanity check
+    }
+
+    // Above MaxHandlersWithoutCache, TryHandle dispatches through its per-type cache; at or below it, it scans.
+    // These run both ways, with filler handlers for an unrelated type.
+    private static ReceiveActorHandlers HandlersWithFillers(bool cached)
+    {
+        var handlers = new ReceiveActorHandlers();
+        var fillers = cached ? ReceiveActorHandlers.MaxHandlersWithoutCache + 1 : 0;
+        for (var i = 0; i < fillers; i++)
+            handlers.AddGenericReceiveHandler<string>(null, _ => throw new InvalidOperationException("filler handler called"));
+        return handlers;
+    }
+
+    [Theory(DisplayName = "Should_UseHandler_When_AddedAfterMessagesOfItsTypeWereHandled")]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Should_UseHandler_When_AddedAfterMessagesOfItsTypeWereHandled(bool cached)
+    {
+        var handlers = HandlersWithFillers(cached);
+        var handled = 0;
+
+        Assert.False(handlers.TryHandle(new Bar()));
+
+        handlers.AddGenericReceiveHandler<IFoo>(null, _ =>
+        {
+            handled++;
+            return true;
+        });
+
+        Assert.True(handlers.TryHandle(new Bar()));
+        Assert.Equal(1, handled);
+    }
+
+    [Theory(DisplayName = "Should_FallThroughInRegistrationOrder_When_EarlierHandlerDeclines")]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Should_FallThroughInRegistrationOrder_When_EarlierHandlerDeclines(bool cached)
+    {
+        var handlers = HandlersWithFillers(cached);
+        var calls = new List<string>();
+        var acceptBar = false;
+
+        handlers.AddGenericReceiveHandler<Bar>(_ =>
+        {
+            calls.Add("predicate");
+            return acceptBar;
+        }, _ =>
+        {
+            calls.Add("bar");
+            return true;
+        });
+        handlers.AddGenericReceiveHandler<IFoo>(null, _ =>
+        {
+            calls.Add("declining");
+            return false;
+        });
+        handlers.AddGenericReceiveHandler<IFoo>(null, _ =>
+        {
+            calls.Add("foo");
+            return true;
+        });
+
+        // Twice, so the cached path also runs on a cache hit.
+        for (var i = 0; i < 2; i++)
+        {
+            calls.Clear();
+            Assert.True(handlers.TryHandle(new Bar()));
+            Assert.Equal(new[] { "predicate", "declining", "foo" }, calls);
+        }
+
+        acceptBar = true;
+        calls.Clear();
+        Assert.True(handlers.TryHandle(new Bar()));
+        Assert.Equal(new[] { "predicate", "bar" }, calls);
+
+        // Baz skips the Bar handler entirely.
+        calls.Clear();
+        Assert.True(handlers.TryHandle(new Baz()));
+        Assert.Equal(new[] { "declining", "foo" }, calls);
+    }
+
+    [Theory(DisplayName = "Should_CallReceiveAny_When_NoTypedHandlerMatches")]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Should_CallReceiveAny_When_NoTypedHandlerMatches(bool cached)
+    {
+        var handlers = HandlersWithFillers(cached);
+        handlers.AddGenericReceiveHandler<Baz>(null, _ => true);
+        object received = null;
+        handlers.AddReceiveAnyHandler(m => received = m);
+
+        var bar = new Bar();
+        Assert.True(handlers.TryHandle(bar));
+        Assert.Same(bar, received);
+
+        received = null;
+        Assert.True(handlers.TryHandle(new Baz()));
+        Assert.Null(received);
     }
 }
