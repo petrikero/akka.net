@@ -552,6 +552,113 @@ namespace Akka.Tests.IO
             await ExpectTerminatedAsync(connection);
         }
 
+        [Fact(DisplayName = "Should_send_CompoundWrite_parts_in_one_stream_write")]
+        public async Task Should_send_CompoundWrite_parts_in_one_stream_write()
+        {
+            using var pair = await ConnectedSocketPair.CreateAsync();
+            await using var stream = new BlockingWriteStream();
+            var handler = CreateTestProbe();
+            var connection = await ConnectAsync(pair, stream, handler);
+
+            handler.Send(connection, new Tcp.CompoundWrite(Write(16, 1),
+                new Tcp.CompoundWrite(Write(16, 2), Write(16, 3))));
+
+            await ExpectAcksAsync(handler, 1, 3);
+            await AwaitAssertAsync(() => stream.WriteSizes.Should().Equal(48));
+            await AbortAsync(connection, handler);
+        }
+
+        [Fact(DisplayName = "Should_send_writes_buffered_before_Register_in_one_stream_write")]
+        public async Task Should_send_writes_buffered_before_Register_in_one_stream_write()
+        {
+            using var pair = await ConnectedSocketPair.CreateAsync();
+            await using var stream = new BlockingWriteStream();
+            var handler = CreateTestProbe();
+            var connection = await ConnectAsync(pair, stream, handler, beforeRegister: c =>
+            {
+                for (var id = 1; id <= 3; id++)
+                    handler.Send(c, Write(16, id));
+            });
+
+            await ExpectAcksAsync(handler, 1, 3);
+            await AwaitAssertAsync(() => stream.WriteSizes.Should().Equal(48));
+            await AbortAsync(connection, handler);
+        }
+
+        [Fact(DisplayName = "Should_flush_unacked_writes_once_When_they_queue_behind_each_other")]
+        public async Task Should_flush_unacked_writes_once_When_they_queue_behind_each_other()
+        {
+            using var pair = await ConnectedSocketPair.CreateAsync();
+            var handler = CreateTestProbe();
+            using var blocked = new BlockedFirstFlush();
+            var connection = await ConnectAsync(pair, blocked.Transport, handler);
+
+            // Write 1's flush holds the actor, so writes 2-4 queue in its mailbox and share one deferred flush.
+            handler.Send(connection, Write(16, 1));
+            await blocked.Entered;
+            for (var i = 0; i < 3; i++)
+                handler.Send(connection, Tcp.Write.Create(new byte[16]));
+            blocked.Release();
+
+            await ExpectAcksAsync(handler, 1, 1);
+            await AwaitAssertAsync(() => blocked.Transport.Flushes.Should().Be(2));
+            await handler.ExpectNoMsgAsync(TimeSpan.FromMilliseconds(100));
+            blocked.Transport.Flushes.Should().Be(2);
+            await AbortAsync(connection, handler);
+        }
+
+        [Fact(DisplayName = "Should_flush_deferred_writes_before_closing_When_Close_arrives_behind_them")]
+        public async Task Should_flush_deferred_writes_before_closing_When_Close_arrives_behind_them()
+        {
+            using var pair = await ConnectedSocketPair.CreateAsync();
+            var handler = CreateTestProbe();
+            var closer = CreateTestProbe();
+            using var blocked = new BlockedFirstFlush();
+            var connection = await ConnectAsync(pair, blocked.Transport, handler);
+
+            // Writes 2 and 3 defer their flush to a FlushNow, which lands behind the Close.
+            handler.Send(connection, Write(16, 1));
+            await blocked.Entered;
+            handler.Send(connection, Tcp.Write.Create(new byte[16]));
+            handler.Send(connection, Tcp.Write.Create(new byte[16]));
+            closer.Send(connection, Tcp.Close.Instance);
+            blocked.Release();
+            blocked.Transport.CompleteReadPump();
+
+            await ExpectAcksAsync(handler, 1, 1);
+            await closer.ExpectMsgAsync<Tcp.Closed>();
+            await ExpectTerminatedAsync(connection);
+            blocked.Transport.FlushesAtFirstClose.Should().Be(2);
+            blocked.Transport.Closes.Should().Be(1);
+        }
+
+        [Fact(DisplayName = "Should_start_the_transport_close_once_When_a_FlushNow_arrives_after_it")]
+        public async Task Should_start_the_transport_close_once_When_a_FlushNow_arrives_after_it()
+        {
+            using var pair = await ConnectedSocketPair.CreateAsync();
+            var handler = CreateTestProbe();
+            var closer = CreateTestProbe();
+            using var blocked = new BlockedFirstFlush();
+            var connection = await ConnectAsync(pair, blocked.Transport, handler);
+
+            // Write 2 schedules a FlushNow behind the Close. Write 3's ack flushes both first, so the close
+            // starts on the Close, and the FlushNow then finds nothing owed.
+            handler.Send(connection, Write(16, 1));
+            await blocked.Entered;
+            handler.Send(connection, Tcp.Write.Create(new byte[16]));
+            handler.Send(connection, Write(16, 3));
+            closer.Send(connection, Tcp.Close.Instance);
+            blocked.Release();
+            blocked.Transport.CompleteReadPump();
+
+            (await handler.ExpectMsgAsync<WriteAck>()).Id.Should().Be(1);
+            (await handler.ExpectMsgAsync<WriteAck>()).Id.Should().Be(3);
+            await closer.ExpectMsgAsync<Tcp.Closed>();
+            await ExpectTerminatedAsync(connection);
+            blocked.Transport.Flushes.Should().Be(2);
+            blocked.Transport.Closes.Should().Be(1);
+        }
+
         private sealed class FakeTransportConnection : TcpConnection
         {
             private readonly IActorRef _bindHandler;
@@ -599,6 +706,8 @@ namespace Akka.Tests.IO
             private readonly TaskCompletionSource<bool> _readCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
             private readonly TaskCompletionSource<bool> _never = new();
             private int _flushes;
+            private int _closes;
+            private int _flushesAtFirstClose = -1;
 
             public FakeTransport(Func<int, ValueTask<FlushResult>> onFlush)
             {
@@ -615,12 +724,56 @@ namespace Akka.Tests.IO
             public bool HasReadError => false;
             public Exception? ReadError => null;
 
+            public int Flushes => Volatile.Read(ref _flushes);
+            public int Closes => Volatile.Read(ref _closes);
+            public int FlushesAtFirstClose => Volatile.Read(ref _flushesAtFirstClose);
+
             public void Write(ReadOnlySequence<byte> data) { }
-            public ValueTask<FlushResult> FlushAsync(CancellationToken ct = default) => _onFlush(++_flushes);
+            public ValueTask<FlushResult> FlushAsync(CancellationToken ct = default) => _onFlush(Interlocked.Increment(ref _flushes));
             public Task ShutdownAsync() => Task.CompletedTask;
-            public Task CloseAsync() => Task.CompletedTask;
+
+            public Task CloseAsync()
+            {
+                if (Interlocked.Increment(ref _closes) == 1)
+                    Volatile.Write(ref _flushesAtFirstClose, Flushes);
+                return Task.CompletedTask;
+            }
             public void Abort() { }
             public ValueTask DisposeAsync() => default;
+        }
+
+        /// <summary>
+        /// A <see cref="FakeTransport"/> whose first flush holds the actor's thread until <see cref="Release"/>,
+        /// so messages sent meanwhile queue in its mailbox. Every flush completes.
+        /// </summary>
+        private sealed class BlockedFirstFlush : IDisposable
+        {
+            private readonly TaskCompletionSource<bool> _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            private readonly ManualResetEventSlim _release = new();
+
+            public BlockedFirstFlush()
+            {
+                Transport = new FakeTransport(n =>
+                {
+                    if (n == 1)
+                    {
+                        _entered.TrySetResult(true);
+                        _release.Wait(TimeSpan.FromSeconds(10));
+                    }
+
+                    return new ValueTask<FlushResult>(new FlushResult(false, false));
+                });
+            }
+
+            public FakeTransport Transport { get; }
+            public Task Entered => _entered.Task;
+            public void Release() => _release.Set();
+
+            public void Dispose()
+            {
+                _release.Set();
+                _release.Dispose();
+            }
         }
     }
 }
