@@ -2,7 +2,7 @@
   <PropertyGroup>
     <Copyright>Copyright © 2013-$([System.DateTime]::Now.Year) Akka.NET Team</Copyright>
     <Authors>Akka.NET Team</Authors>
-    <VersionPrefix>1.6.0-beta4</VersionPrefix>
+    <VersionPrefix>1.6.0-beta6</VersionPrefix>
     <PackageIcon>akkalogo.png</PackageIcon>
     <PackageProjectUrl>https://getakka.net/</PackageProjectUrl>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
@@ -41,6 +41,7 @@
     <MessagePackVersion>3.1.12</MessagePackVersion>
     <MicrosoftDataSqliteVersion>10.0.12</MicrosoftDataSqliteVersion>
     <MicrosoftCodeAnalysisCSharpVersion>4.13.0</MicrosoftCodeAnalysisCSharpVersion>
+    <MicrosoftCodeAnalysisCSharpTestHarnessVersion>5.9.0</MicrosoftCodeAnalysisCSharpTestHarnessVersion>
     <NetTestVersion>net10.0</NetTestVersion>
     <FsharpVersion>10.1.302</FsharpVersion>
     <NetStandardLibVersion>net10.0</NetStandardLibVersion>
@@ -65,46 +66,24 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
   <PropertyGroup>
-    <PackageReleaseNotes>Akka.NET 1.6.0-beta4 simplifies source-generated serializer registration, adds three generator diagnostics that catch schema mistakes earlier, and cuts allocations across Artery, TCP and Akka.Streams. Read the [v1.6 getting started guide](https://github.com/akkadotnet/akka.net/blob/dev/GETTING_STARTED_V1.6.md) for the full upgrade path.
+    <PackageReleaseNotes>Akka.NET 1.6.0-beta6 adds top-level C# 15 union serialization and makes distributed data the default store for cluster sharding coordinator state. Read the [v1.6 getting started guide](https://github.com/akkadotnet/akka.net/blob/dev/GETTING_STARTED_V1.6.md) for the full upgrade path.
 
 **Serialization V2**
 
-* Generated serializers now return core `SerializerDetails` instead of the removed `Akka.Serialization.V2.SerializerRegistration`. Declare `CreateSerializerDetails(ExtendedActorSystem)` and pass its method group to Akka.Hosting's `WithCustomSerializer`, or invoke it inside `SerializationSetup.Create`. ([#8852](https://github.com/akkadotnet/akka.net/pull/8852))
-* The generator now validates a marked type's shape as soon as `[AkkaSerializable]` appears, before any serializer references it. Missing fields, duplicate indices, inaccessible declarations and inaccessible getters report at their source declarations, including on open generic definitions. Malformed types that used to compile silently now fail. ([#8860](https://github.com/akkadotnet/akka.net/pull/8860), fixes [#8853](https://github.com/akkadotnet/akka.net/issues/8853))
-* AKKASG046 warns when a marked type declares a public stored property with no `[AkkaField]` - that property is not serialized. AKKASG047 warns when a type carries `[AkkaField]` annotations but no `[AkkaSerializable]`, so the annotations are ignored. Both are warnings, and both fail a warnings-as-errors build. ([#8861](https://github.com/akkadotnet/akka.net/pull/8861), fixes [#8854](https://github.com/akkadotnet/akka.net/issues/8854); [#8862](https://github.com/akkadotnet/akka.net/pull/8862), fixes [#8856](https://github.com/akkadotnet/akka.net/issues/8856))
-* Generated message helper names no longer collide when two message types share a simple name across namespaces. ([#8859](https://github.com/akkadotnet/akka.net/pull/8859))
+* C# 15 unions can now be sent or persisted as top-level messages with `[AkkaSerializable(Manifest = "...")]`. Deserialization reconstructs the boxed union, so `Receive&lt;TUnion&gt;` and `Recover&lt;TUnion&gt;` handlers continue to match. Closed generic unions register each construction with `[AkkaSerializerIncludes&lt;T&gt;]`. Standalone cases retain their own manifests, and explicitly included types discovered in referenced assemblies no longer cause duplicate registrations. ([#8908](https://github.com/akkadotnet/akka.net/pull/8908), fixes [#8906](https://github.com/akkadotnet/akka.net/issues/8906))
+* Top-level unions use their own manifest with the existing union-field payload frame. Writing `default(TUnion)` at the top level throws `SerializationException`; field nil semantics are unchanged. AKKASG051 now requires an explicit manifest on a marked union. Reordering cases preserves the wire format; adding cases requires readers to upgrade before writers use them, and removing cases prevents reading stored values of those cases. Switching between a union and a closed hierarchy still requires a migration for top-level messages. ([#8908](https://github.com/akkadotnet/akka.net/pull/8908))
 
-**Akka.Remote / Artery (experimental)**
+**Akka.Cluster.Sharding - behavior change**
 
-* An idle Artery association no longer reconnects to a peer that shut down. A failed stream with no queued traffic or unacknowledged system messages goes dormant instead of retrying forever; channels and reliable delivery state stay intact, and normal sends or `ActorSelection.ResolveOne` wake the association with a fresh handshake. ([#8858](https://github.com/akkadotnet/akka.net/pull/8858), fixes [#8857](https://github.com/akkadotnet/akka.net/issues/8857))
-* Quarantine notices survive bounded control-stream retries, and quarantined reliable delivery resets before restart replay. ([#8863](https://github.com/akkadotnet/akka.net/pull/8863))
-* Artery envelope encoding no longer allocates a closure per message, and metadata is written as UTF-8 straight into the frame buffer. ([#8804](https://github.com/akkadotnet/akka.net/pull/8804), [#8805](https://github.com/akkadotnet/akka.net/pull/8805))
+* `akka.cluster.sharding.state-store-mode` now defaults to `ddata` instead of `persistence`. Coordinator state is replicated through Akka.DistributedData. The previous default silently used the in-memory journal when no durable journal was configured, losing coordinator state when the coordinator moved. ([#8905](https://github.com/akkadotnet/akka.net/pull/8905), addresses [#8903](https://github.com/akkadotnet/akka.net/issues/8903))
+* **Migration:** set `akka.cluster.sharding.state-store-mode = persistence` explicitly to preserve the previous behavior. With `remember-entities = on`, the new default follows `remember-entities-store`, which defaults to `ddata`, rather than forcing the event-sourced store. Set `akka.cluster.sharding.remember-entities-store = eventsourced` to keep reading remembered entities from the journal. See the [v1.6 breaking-change ledger](https://github.com/akkadotnet/akka.net/blob/dev/BREAKING_CHANGES_V1.6.md). ([#8905](https://github.com/akkadotnet/akka.net/pull/8905))
 
-**Akka.Streams**
-
-* `Source.Lazily` now surfaces a factory exception through the materialized task instead of losing it. ([#8843](https://github.com/akkadotnet/akka.net/pull/8843))
-* Value-type elements stay typed across fused connections and restart substream ingress, so they no longer box on every hop. ([#8807](https://github.com/akkadotnet/akka.net/pull/8807), [#8824](https://github.com/akkadotnet/akka.net/pull/8824))
-* Async callbacks skip closure allocation when ingress tracing is off. ([#8823](https://github.com/akkadotnet/akka.net/pull/8823))
-
-**Akka.Cluster.Sharding**
-
-* A shard handoff no longer drops the owner's termination signal while handoff acknowledgements are still in flight. ([#8865](https://github.com/akkadotnet/akka.net/pull/8865))
-
-**Performance**
-
-* TCP reads avoid per-read closures and nested async wrappers. ([#8825](https://github.com/akkadotnet/akka.net/pull/8825))
-* Generated serializers skip counting-writer allocations for known buffer writers, and `IReadOnlyList` serialization no longer boxes enumerators. ([#8822](https://github.com/akkadotnet/akka.net/pull/8822), [#8808](https://github.com/akkadotnet/akka.net/pull/8808))
-
-**Dependency updates**
-
-* MessagePack 3.1.12, Google.Protobuf 3.36.2, LightningDB 0.23.1, Microsoft.Data.Sqlite, Grpc.Tools 2.84.0, FsCheck.Xunit 3.6.0. ([#8803](https://github.com/akkadotnet/akka.net/pull/8803), [#8776](https://github.com/akkadotnet/akka.net/pull/8776), [#8797](https://github.com/akkadotnet/akka.net/pull/8797), [#8801](https://github.com/akkadotnet/akka.net/pull/8801), [#8593](https://github.com/akkadotnet/akka.net/pull/8593), [#8833](https://github.com/akkadotnet/akka.net/pull/8833))
-
-2 contributors since release 1.6.0-beta3
+2 contributors since release 1.6.0-beta5
 
 | COMMITS | LOC+ | LOC- | AUTHOR          |
 |---------|------|------|-----------------|
-| 21      | 7970 | 1605 | Aaron Stannard  |
-| 1       | 61   | 2    | Ariel Fischer   |</PackageReleaseNotes>
+| 2       | 328  | 30   | Aaron Stannard  |
+| 1       | 1    | 1    | dependabot[bot] |</PackageReleaseNotes>
   </PropertyGroup>
   <ItemGroup Label="Analyzers" Condition="'$(MSBuildProjectName)' != 'Akka'">
     <PackageReference Include="Akka.Analyzers" Version="$(AkkaAnalyzerVersion)" PrivateAssets="all" />
