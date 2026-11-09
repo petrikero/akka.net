@@ -45,6 +45,7 @@ namespace Akka.Tests.IO
             var pipe = new Pipe(PipeOptions.Default);
             var probe = CreateTestProbe();
             var reader = new TcpConnection.PipeReadToActor(pipe.Reader, CancellationToken.None, probe.Ref);
+            TcpConnection.PipeReadCompleted? previous = null;
 
             for (var i = 0; i < 3; i++)
             {
@@ -58,7 +59,35 @@ namespace Akka.Tests.IO
                 Text(msg.Data).Should().Be($"read-{i}");
                 msg.IsCompleted.Should().BeFalse();
                 msg.IsCanceled.Should().BeFalse();
+
+                // Every read reuses the same message, so a read does not allocate one.
+                if (previous != null)
+                    msg.Should().BeSameAs(previous);
+                previous = msg;
             }
+        }
+
+        [Fact(DisplayName = "PipeReadCompleted.Take should return the result and leave the message empty")]
+        public async Task Take_should_return_the_result_and_clear_the_message()
+        {
+            var pipe = new Pipe(PipeOptions.Default);
+            var probe = CreateTestProbe();
+            var reader = new TcpConnection.PipeReadToActor(pipe.Reader, CancellationToken.None, probe.Ref);
+
+            await WriteAsync(pipe.Writer, "last");
+            await pipe.Writer.CompleteAsync();
+            reader.Start();
+
+            var msg = await probe.ExpectMsgAsync<TcpConnection.PipeReadCompleted>();
+            var data = msg.Take(out var isCompleted, out var isCanceled);
+            Text(data).Should().Be("last");
+            isCompleted.Should().BeTrue();
+            isCanceled.Should().BeFalse();
+
+            // A stale reference to the reused message must not see this read's result, or a later one's.
+            msg.Data.Length.Should().Be(0);
+            msg.IsCompleted.Should().BeFalse();
+            msg.IsCanceled.Should().BeFalse();
         }
 
         [Fact(DisplayName = "PipeReadToActor should deliver data already in the pipe without waiting")]
