@@ -190,6 +190,12 @@ namespace Akka.Remote.Artery
         // WHICH lane a given send's envelope lands in (<see cref="SelectLane"/>, cached per
         // <see cref="RemoteActorRef"/>) and which lane(s) a materialized stream reads from.
         private readonly Channel<IOutboundEnvelope>[] _laneChannels;
+
+        // Per lane: envelopes the lane's ArteryBatchEncodeStage had taken from the channel but not
+        // sent when its materialization stopped. The next materialization emits them before reading
+        // the channel, so the lane keeps its order; transport shutdown drains them with the channel.
+        // Guarded by locking the array itself.
+        private readonly Queue<IOutboundEnvelope>?[] _laneCarryOver;
         private readonly Channel<IOutboundEnvelope> _controlChannel;
 
         /// <summary>
@@ -440,6 +446,7 @@ namespace Akka.Remote.Artery
             _state = AssociationState.Create();
 
             _laneChannels = new Channel<IOutboundEnvelope>[OutboundLanes];
+            _laneCarryOver = new Queue<IOutboundEnvelope>?[OutboundLanes];
             for (var i = 0; i < OutboundLanes; i++)
             {
                 _laneChannels[i] = Channel.CreateBounded<IOutboundEnvelope>(new BoundedChannelOptions(outboundQueueCapacity)
@@ -586,6 +593,26 @@ namespace Akka.Remote.Artery
         /// <see cref="_systemMessageDeliveryState"/>.
         /// </summary>
         public SystemMessageDeliveryState SystemMessageDeliveryState => _systemMessageDeliveryState;
+
+        private InboundSequenceEntry? _inboundSequence;
+
+        /// <summary>
+        /// The receiver-side system-message expectation for peer incarnation <paramref name="uid"/>. One entry per
+        /// association: a new incarnation replaces the previous one's entry, so nothing is kept for dead peers.
+        /// </summary>
+        public InboundSequenceEntry InboundSequenceFor(long uid)
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref _inboundSequence);
+                if (current != null && current.Uid == uid)
+                    return current;
+
+                var fresh = new InboundSequenceEntry(uid);
+                if (ReferenceEquals(Interlocked.CompareExchange(ref _inboundSequence, fresh, current), current))
+                    return fresh;
+            }
+        }
 
         /// <summary>
         /// Whether this association's ORDINARY outbound stream has been permanently torn down by
@@ -841,8 +868,54 @@ namespace Akka.Remote.Artery
         public static bool IsBestEffortControlMessage(object message) => message is
             HandshakeReq or HandshakeRsp or ArteryHeartbeat or ArteryHeartbeatRsp or Ack or Nack;
 
-        /// <summary>Whether any ordinary lane still contains accepted user traffic.</summary>
-        public bool HasQueuedOutbound => Array.Exists(_laneChannels, channel => channel.Reader.Count > 0);
+        /// <summary>Whether any ordinary lane still contains accepted user traffic, carried over or in its channel.</summary>
+        public bool HasQueuedOutbound
+        {
+            get
+            {
+                lock (_laneCarryOver)
+                    if (Array.Exists(_laneCarryOver, carried => carried is { Count: > 0 }))
+                        return true;
+                return Array.Exists(_laneChannels, channel => channel.Reader.Count > 0);
+            }
+        }
+
+        /// <summary>
+        /// Keeps <paramref name="held"/> -- envelopes a stopped encode stage of ordinary lane
+        /// <paramref name="lane"/> took from the channel and never sent, oldest first -- for the next
+        /// materialization of that lane. Returns <see langword="false"/> once the outbound stream
+        /// is shut down; the caller then reports them as dropped.
+        /// </summary>
+        public bool TryCarryOver(int lane, Queue<IOutboundEnvelope> held)
+        {
+            lock (_laneCarryOver)
+            {
+                if (_outboundShutDown)
+                    return false;
+
+                // Anything still carried was read after `held`, so it goes behind it.
+                if (_laneCarryOver[lane] is { } older)
+                    foreach (var envelope in older)
+                        held.Enqueue(envelope);
+
+                _laneCarryOver[lane] = held;
+                return true;
+            }
+        }
+
+        /// <summary>Whether ordinary lane <paramref name="lane"/> has carried-over envelopes.</summary>
+        public bool HasCarryOver(int lane)
+        {
+            lock (_laneCarryOver)
+                return _laneCarryOver[lane] is { Count: > 0 };
+        }
+
+        /// <summary>Takes the oldest carried-over envelope of ordinary lane <paramref name="lane"/>, or <see langword="null"/>.</summary>
+        public IOutboundEnvelope? TakeCarryOver(int lane)
+        {
+            lock (_laneCarryOver)
+                return _laneCarryOver[lane] is { Count: > 0 } carried ? carried.Dequeue() : null;
+        }
 
         /// <summary>
         /// Attempts to enqueue <paramref name="element"/> onto ordinary-outbound LANE 0. Non-blocking
@@ -885,9 +958,26 @@ namespace Akka.Remote.Artery
         /// uid into <c>[0, lanes)</c> -- functionally equivalent to "abs mod lanes" for partitioning
         /// purposes, just crash-proof.
         /// </para>
+        ///
+        /// <para>
+        /// The uid is multiplied by a 64-bit odd constant and the high 32 bits of the product are
+        /// taken before the modulo. Under Artery, actor UIDs come from a per-system counter, so actors
+        /// created in a repeating pattern (an actor and its peer, created in turn) have UIDs with a
+        /// fixed stride; a plain <c>uid % lanes</c> would put all of them on the same few lanes.
+        /// The same uid always maps to the same lane, so per-recipient ordering is unchanged; the
+        /// cost is one multiply and a shift per send.
+        /// </para>
         /// </summary>
         public static int SelectLane(long recipientUid, int lanes) =>
-            lanes <= 1 ? 0 : (int)(unchecked((ulong)recipientUid) % (ulong)lanes);
+            lanes <= 1 ? 0 : (int)((unchecked((ulong)recipientUid * 0x9E3779B97F4A7C15UL) >> 32) % (ulong)lanes);
+
+        /// <summary>
+        /// The lane for a message that carries both a sender and a recipient id, on the outbound
+        /// side and on the inbound reader alike: a mix of the two ids, so one pair's messages always
+        /// share a lane while different senders to the same recipient spread across lanes.
+        /// </summary>
+        public static int SelectPairLane(long senderId, long recipientId, int lanes) =>
+            SelectLane(unchecked(senderId * -7046029254386353131L + recipientId), lanes);
 
         /// <summary>
         /// Attempts to enqueue <paramref name="element"/> for the CONTROL outbound stream to send.
@@ -1051,9 +1141,23 @@ namespace Akka.Remote.Artery
         /// </summary>
         public void DrainOutboundToDropped(Action<IOutboundEnvelope> onDrained)
         {
-            foreach (var laneChannel in _laneChannels)
-                while (laneChannel.Reader.TryRead(out var envelope))
+            for (var lane = 0; lane < _laneChannels.Length; lane++)
+            {
+                // Carried-over envelopes are older than the channel's, so they are reported first.
+                Queue<IOutboundEnvelope>? carried;
+                lock (_laneCarryOver)
+                {
+                    carried = _laneCarryOver[lane];
+                    _laneCarryOver[lane] = null;
+                }
+
+                if (carried is not null)
+                    foreach (var envelope in carried)
+                        onDrained(envelope);
+
+                while (_laneChannels[lane].Reader.TryRead(out var envelope))
                     onDrained(envelope);
+            }
         }
 
         /// <summary>
@@ -1317,6 +1421,19 @@ namespace Akka.Remote.Artery
         public Association? TryGetByUid(long uid) => _byUid.TryGetValue(uid, out var association) ? association : null;
 
         /// <summary>
+        /// The acker entry of <paramref name="origin"/>, held by its association, or null (per-connection memory
+        /// only) when the frame's uid does not match or the peer is not the association's current incarnation.
+        /// </summary>
+        public InboundSequenceEntry? GetInboundSequenceEntry(long originUid, UniqueAddress origin)
+        {
+            if (origin.Uid != originUid)
+                return null;
+            return _byUid.TryGetValue(originUid, out var association) && association.RemoteAddress.Equals(origin.Address)
+                ? association.InboundSequenceFor(originUid)
+                : null;
+        }
+
+        /// <summary>
         /// A point-in-time snapshot of every association currently known to this registry. Used by
         /// <c>ArteryRemoting.Shutdown</c> to complete every association's outbound channel.
         /// </summary>
@@ -1366,5 +1483,17 @@ namespace Akka.Remote.Artery
             _byUid[peer.Uid] = association;
             return updated;
         }
+    }
+
+    /// <summary>INTERNAL API. System-message expectation of an association's current peer incarnation, shared by its control connections; also the lock the acker handles its messages under.</summary>
+    internal sealed class InboundSequenceEntry
+    {
+        public InboundSequenceEntry(long uid) => Uid = uid;
+
+        /// <summary>The peer incarnation this expectation belongs to.</summary>
+        public long Uid { get; }
+
+        /// <summary>Next expected seq; guarded by lock (this).</summary>
+        public long Next = 1;
     }
 }

@@ -19,9 +19,7 @@ namespace Akka.Actor
 {
     public partial class ActorCell
     {
-        private volatile IChildrenContainer _childrenContainerDoNotCallMeDirectly = EmptyChildrenContainer.Instance;
         private long _nextRandomNameDoNotCallMeDirectly = -1; // Interlocked.Increment automatically adds 1 to this value. Allows us to start from 0.
-        private ImmutableDictionary<string, FunctionRef> _functionRefsDoNotCallMeDirectly = ImmutableDictionary<string, FunctionRef>.Empty;
 
         /// <summary>
         /// The child container collection, used to house information about all child actors.
@@ -47,7 +45,7 @@ namespace Akka.Actor
         {
             var r = GetRandomActorName("$$");
             var n = string.IsNullOrEmpty(suffix) ? r : r + "-" + suffix;
-            var childPath = new ChildActorPath(Self.Path, n, NewUid());
+            var childPath = new ChildActorPath(Self.Path, n, NewUid(SystemImpl));
             var functionRef = new FunctionRef(childPath, SystemImpl.Provider, SystemImpl.EventStream, tell);
 
             return ImmutableInterlocked.GetOrAdd(ref _functionRefsDoNotCallMeDirectly, childPath.Name, functionRef);
@@ -467,7 +465,7 @@ namespace Akka.Actor
             IInternalActorRef actor;
             try
             {
-                var childPath = new ChildActorPath(Self.Path, name, NewUid());
+                var childPath = new ChildActorPath(Self.Path, name, NewUid(SystemImpl));
                 actor = SystemImpl.Provider.ActorOf(SystemImpl, props, _self, childPath,
                     systemService: systemService, deploy: null, lookupDeploy: true, async: async);
             }

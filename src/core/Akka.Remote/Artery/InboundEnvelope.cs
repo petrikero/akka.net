@@ -60,14 +60,8 @@ namespace Akka.Remote.Artery
         int SerializerId { get; }
 
         /// <summary>
-        /// The manifest string decoded from the envelope's header (resolved BEFORE payload
-        /// deserialization -- design.md's "Decode order (structural, not an optimization)"), used
-        /// to deserialize <see cref="Message"/>. Retained on the envelope (not just consumed and
-        /// discarded once <see cref="Message"/> is produced) because the G5 lane model
-        /// deserializes AFTER partitioning to a lane -- the envelope has to carry the manifest
-        /// (and, eventually, the raw payload bytes) across that lane boundary. Also useful for
-        /// dead-letter/debug fidelity in the meantime (a decode/dispatch failure can still report
-        /// what manifest was on the wire).
+        /// The wire manifest, decoded on demand for frame-backed envelopes. Deserialization consumes
+        /// the borrowed UTF-8 bytes before constructing the envelope.
         /// </summary>
         string Manifest { get; }
 
@@ -95,7 +89,23 @@ namespace Akka.Remote.Artery
     /// <param name="Manifest">The manifest string decoded from the envelope's header -- see <see cref="IInboundEnvelope.Manifest"/>.</param>
     internal sealed record InboundEnvelope(object Message, string? SenderPath, string? RecipientPath, long OriginUid, int SerializerId, string Manifest) : IInboundEnvelope
     {
+        private readonly string _manifest = Manifest;
+
+        /// <inheritdoc />
+        public string Manifest
+        {
+            get => Frame is { } frame && frame.TryGetManifest(out var manifest) ? manifest : _manifest;
+            init => _manifest = value;
+        }
+
         /// <inheritdoc/>
         public bool IsControl { get; } = Message is IArteryControlMessage;
+
+        /// <summary>
+        /// The decoded frame of an ordinary message decoded inline (inbound-lanes = 1), whose
+        /// <see cref="SenderPath"/> and <see cref="RecipientPath"/> are then left <see langword="null"/>:
+        /// the dispatcher decodes a path literal only when the header's ref id does not resolve it.
+        /// </summary>
+        public ArteryEnvelopeDecoded? Frame { get; init; }
     }
 }

@@ -103,7 +103,15 @@ namespace Akka.Actor
         public static Task<T> Ask<T>(this ICanTell self, object message, TimeSpan? timeout, CancellationToken cancellationToken)
         {
             var future = BeginAsk<T>(self, timeout, cancellationToken, out var result);
-            future.DeliverAsk(message, self);
+            try
+            {
+                future.DeliverAsk(message, self);
+            }
+            catch
+            {
+                future.CleanupAsk();
+                throw;
+            }
             return result;
         }
 
@@ -122,8 +130,16 @@ namespace Akka.Actor
         public static Task<T> Ask<T>(this ICanTell self, Func<IActorRef, object> messageFactory, TimeSpan? timeout, CancellationToken cancellationToken)
         {
             var future = BeginAsk<T>(self, timeout, cancellationToken, out var result);
-            var message = messageFactory(future);
-            future.DeliverAsk(message, self);
+            try
+            {
+                var message = messageFactory(future);
+                future.DeliverAsk(message, self);
+            }
+            catch
+            {
+                future.CleanupAsk();
+                throw;
+            }
             return result;
         }
 
@@ -136,49 +152,40 @@ namespace Akka.Actor
                 throw new ArgumentException("Unable to resolve the target Provider", nameof(self));
 
             var result = TaskEx.NonBlockingTaskCompletionSource<T>();
+            var future = provider.CreateFutureRef(result);
+            future.AskProvider = provider;
 
-            CancellationTokenSource? timeoutCancellation = null;
+            // Register before arming the timeout or the cancellation callback: either can complete
+            // the Ask and run its cleanup immediately (e.g. an already-canceled token).
+            provider.RegisterTempActor(future, future.Path);
+
             timeout ??= provider.Settings.AskTimeout;
-
-            CancellationTokenRegistration? ctr1 = null;
-            CancellationTokenRegistration? ctr2 = null;
 
             if (timeout != Timeout.InfiniteTimeSpan && timeout.Value > default(TimeSpan))
             {
-                timeoutCancellation = new CancellationTokenSource();
+                future.AskTimeout = timeout.Value;
 
-                ctr1 = timeoutCancellation.Token.Register(() =>
+                // Timer captures the ExecutionContext, CancelAfter did not
+                var suppressFlow = !ExecutionContext.IsFlowSuppressed();
+                var flowControl = suppressFlow ? ExecutionContext.SuppressFlow() : default;
+                try
                 {
-                    result.TrySetException(new AskTimeoutException($"Timeout after {timeout.Value.TotalSeconds:F2} seconds"));
-                });
-
-                timeoutCancellation.CancelAfter(timeout.Value);
+                    future.AskTimeoutTimer = TimeProvider.System.CreateTimer(FutureActorRef<T>.OnAskTimeout, future, timeout.Value, Timeout.InfiniteTimeSpan);
+                }
+                finally
+                {
+                    if (suppressFlow)
+                        flowControl.Undo();
+                }
             }
 
             if (cancellationToken.CanBeCanceled)
             {
-                ctr2 = cancellationToken.Register(() => result.TrySetCanceled());
-            }
+                future.AskCancellationRegistration = cancellationToken.Register(FutureActorRef<T>.OnAskCancel, future);
 
-            var future = provider.CreateFutureRef(result);
-            var path = future.Path;
-
-            try
-            {
-                // Register before attaching cleanup: a pre-canceled task can run it immediately.
-                provider.RegisterTempActor(future, path);
-            }
-            finally
-            {
-                // Keep cleanup attached even if temporary registration throws.
-                _ = result.Task.ContinueWith(_ =>
-                {
-                    provider.UnregisterTempActor(path);
-
-                    ctr1?.Dispose();
-                    ctr2?.Dispose();
-                    timeoutCancellation?.Dispose();
-                }, TaskContinuationOptions.ExecuteSynchronously);
+                // The timeout may have completed the Ask (and run cleanup) before the registration was stored.
+                if (result.Task.IsCompleted)
+                    future.AskCancellationRegistration.Dispose();
             }
 
             resultTask = result.Task;

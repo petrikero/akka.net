@@ -88,17 +88,38 @@ namespace Akka.IO
         /// <summary>
         /// Self-tell: PipeReader.ReadAsync completed with data.
         /// </summary>
+        /// <remarks>
+        /// <see cref="PipeReadToActor"/> sends the same instance for every read of its connection. It refills it only
+        /// for the next read, and the connection starts the next read only after it has handled this one.
+        /// </remarks>
         internal sealed class PipeReadCompleted : INoSerializationVerificationNeeded
         {
-            public ReadOnlySequence<byte> Data { get; }
-            public bool IsCompleted { get; }
-            public bool IsCanceled { get; }
+            public ReadOnlySequence<byte> Data { get; private set; }
+            public bool IsCompleted { get; private set; }
+            public bool IsCanceled { get; private set; }
 
             public PipeReadCompleted(ReadOnlySequence<byte> data, bool isCompleted, bool isCanceled)
+            {
+                Set(data, isCompleted, isCanceled);
+            }
+
+            internal PipeReadCompleted Set(ReadOnlySequence<byte> data, bool isCompleted, bool isCanceled)
             {
                 Data = data;
                 IsCompleted = isCompleted;
                 IsCanceled = isCanceled;
+                return this;
+            }
+
+            /// <summary>
+            /// Returns <see cref="Data"/> and drops this message's reference to it, so the reused message does not
+            /// keep the last read's array alive.
+            /// </summary>
+            internal ReadOnlySequence<byte> TakeData()
+            {
+                var data = Data;
+                Data = ReadOnlySequence<byte>.Empty;
+                return data;
             }
         }
 
@@ -961,7 +982,7 @@ namespace Akka.IO
         private void HandlePipeRead(PipeReadCompleted msg)
         {
             _readPending = false;
-            var data = msg.Data;
+            var data = msg.TakeData();
 
             if (data.Length > 0)
             {
@@ -1036,11 +1057,32 @@ namespace Akka.IO
         /// </summary>
         internal sealed class PipeReadToActor
         {
+            // Fresh receiver-owned arrays stay below the 85,000-byte LOH threshold, including headers.
+            internal const int ReadCopyChunkSize = 80 * 1024;
+
+            // Links are set only while building a delivery, before it is published to the receiver.
+            // Keep these separate from write-owned segments: write coalescing must wrap, never move them.
+            private sealed class ReadSequenceSegment : ReadOnlySequenceSegment<byte>
+            {
+                public ReadSequenceSegment(ReadOnlyMemory<byte> memory, ReadSequenceSegment? previous)
+                {
+                    Memory = memory;
+                    if (previous is not null)
+                    {
+                        RunningIndex = previous.RunningIndex + previous.Memory.Length;
+                        previous.Next = this;
+                    }
+                }
+            }
+
             private readonly PipeReader _reader;
             private readonly CancellationToken _ct;
             private readonly IActorRef _self;
             private readonly Action _onCompleted;
             private ValueTask<ReadResult> _pending;
+
+            // Sent for every read; see PipeReadCompleted's remarks for why reusing it is safe.
+            private readonly PipeReadCompleted _completed = new(ReadOnlySequence<byte>.Empty, false, false);
 
             public PipeReadToActor(PipeReader reader, CancellationToken ct, IActorRef self)
             {
@@ -1080,7 +1122,24 @@ namespace Akka.IO
                         // Tell is asynchronous, so consumers must own stable bytes before AdvanceTo
                         // returns the pipe's segments to its pool. Keep this copy on the ordinary TCP path.
                         ReadOnlySequence<byte> data;
-                        if (buffer.Length > 0)
+                        if (buffer.Length > ReadCopyChunkSize)
+                        {
+                            ReadSequenceSegment? head = null;
+                            ReadSequenceSegment? tail = null;
+                            while (!buffer.IsEmpty)
+                            {
+                                var length = (int)Math.Min(buffer.Length, ReadCopyChunkSize);
+                                var array = new byte[length];
+                                buffer.Slice(0, length).CopyTo(array);
+                                // No pool or disposable owner: these fresh arrays belong to the receiver indefinitely.
+                                var segment = new ReadSequenceSegment(array, tail);
+                                head ??= segment;
+                                tail = segment;
+                                buffer = buffer.Slice(length);
+                            }
+                            data = new ReadOnlySequence<byte>(head!, 0, tail!, tail!.Memory.Length);
+                        }
+                        else if (buffer.Length > 0)
                         {
                             var array = new byte[checked((int)buffer.Length)];
                             buffer.CopyTo(array);
@@ -1097,7 +1156,7 @@ namespace Akka.IO
                         {
                             // Must be the last statement: once the actor sees this it may call Start() immediately,
                             // reusing this instance and overwriting _pending on another thread.
-                            _self.Tell(new PipeReadCompleted(data, result.IsCompleted, result.IsCanceled));
+                            _self.Tell(_completed.Set(data, result.IsCompleted, result.IsCanceled));
                             return;
                         }
                     }

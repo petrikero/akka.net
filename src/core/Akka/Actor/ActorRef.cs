@@ -128,6 +128,42 @@ namespace Akka.Actor
         /// </summary>
         public override IActorRefProvider Provider => _provider;
 
+        // INTERNAL API: timeout, cancellation and cleanup state of the Ask that created this reference, kept
+        // here instead of in a separate object per Ask. AskProvider is null when no Ask owns this reference.
+        internal IActorRefProvider AskProvider;
+        internal TimeSpan AskTimeout;
+        internal ITimer AskTimeoutTimer;
+        internal CancellationTokenRegistration AskCancellationRegistration;
+        private int _askCleanedUp;
+
+        internal static readonly TimerCallback OnAskTimeout = static s =>
+        {
+            var future = (FutureActorRef<T>)s;
+            if (future._result.TrySetException(new AskTimeoutException($"Timeout after {future.AskTimeout.TotalSeconds:F2} seconds")))
+                future.CleanupAsk();
+        };
+
+        internal static readonly Action<object> OnAskCancel = static s =>
+        {
+            var future = (FutureActorRef<T>)s;
+            if (future._result.TrySetCanceled())
+                future.CleanupAsk();
+        };
+
+        /// <summary>
+        /// INTERNAL API: unregisters the Ask's temporary actor and releases its timeout and cancellation callbacks.
+        /// Called by whichever route completes the Ask, after it completes the task; runs at most once.
+        /// </summary>
+        internal void CleanupAsk()
+        {
+            if (AskProvider is null || Interlocked.Exchange(ref _askCleanedUp, 1) != 0)
+                return;
+
+            AskProvider.UnregisterTempActor(_path);
+            AskTimeoutTimer?.Dispose();
+            AskCancellationRegistration.Dispose();
+        }
+
         /// <summary>
         /// Completes the task for a compatible ordinary reply and faults it for system messages, failure replies, or incompatible reply types.
         /// </summary>
@@ -165,6 +201,9 @@ namespace Akka.Actor
                     break;
             }
 
+            if (_result.Task.IsCompleted)
+                CleanupAsk();
+
             //ignore canceled ask and put unhandled answers into deadletter
             if (!handled && !_result.Task.IsCanceled)
                 _provider.DeadLetters.Tell(message ?? default(T), this);            
@@ -194,7 +233,8 @@ namespace Akka.Actor
             else
             {
                 // TODO: blow up the caller here by just throwing the exception at the callsite?
-                _result.TrySetException(new InvalidOperationException($"system message of type '{message.GetType().Name}' is invalid for {nameof(FutureActorRef<T>)}"));
+                if (_result.TrySetException(new InvalidOperationException($"system message of type '{message.GetType().Name}' is invalid for {nameof(FutureActorRef<T>)}")))
+                    CleanupAsk();
             }
         }
 
@@ -565,6 +605,16 @@ namespace Akka.Actor
     [InternalApi]
     public abstract class MinimalActorRef : InternalActorRefBase, ILocalRef
     {
+        /// <summary>
+        /// INTERNAL API. The id an Ask future carries on the Artery wire (its path has no uid), 0 for
+        /// any other ref: <see cref="TempChildIdFlag"/> combined with the temp counter value its
+        /// /temp name was made from, so the receiving system finds it in the temp container.
+        /// </summary>
+        internal long WireId;
+
+        /// <summary>INTERNAL API. Marks a wire id as a child of /temp whose low 63 bits are its temp number.</summary>
+        internal const long TempChildIdFlag = long.MinValue;
+
         /// <inheritdoc cref="InternalActorRefBase"/>
         public override IInternalActorRef Parent
         {
@@ -851,7 +901,7 @@ namespace Akka.Actor
         /// <param name="name">The direct child name to find.</param>
         /// <param name="child">Receives the child reference when one is registered under that name.</param>
         /// <returns><c>true</c> if a child with that name is registered; otherwise, <c>false</c>.</returns>
-        protected bool TryGetChild(string name, out IInternalActorRef child)
+        protected internal bool TryGetChild(string name, out IInternalActorRef child)
         {
             return _children.TryGetValue(name, out child);
         }
@@ -863,11 +913,14 @@ namespace Akka.Actor
         /// <param name="actor">The child reference to register.</param>
         public void AddChild(string name, IInternalActorRef actor)
         {
-            _children.AddOrUpdate(name, actor, (_, v) =>
+            while (!_children.TryAdd(name, actor))
             {
-                Log.Warning("{0} replacing child {1} ({2} -> {3})", name, actor, v, actor);
-                return v;
-            });
+                if (_children.TryGetValue(name, out var v))
+                {
+                    Log.Warning("{0} replacing child {1} ({2} -> {3})", name, actor, v, actor);
+                    return;
+                }
+            }
         }
 
         /// <summary>
