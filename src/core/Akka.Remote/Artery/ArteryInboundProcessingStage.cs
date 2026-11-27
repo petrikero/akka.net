@@ -29,8 +29,8 @@ namespace Akka.Remote.Artery
     /// (<see cref="ArteryEnvelopeCodec"/>), and deserializes the payload of every subsequent frame,
     /// wrapping each in an <see cref="IInboundEnvelope"/> -- a control envelope
     /// (<see cref="IInboundEnvelope.IsControl"/> true, <see cref="IInboundEnvelope.RecipientPath"/>
-    /// <see langword="null"/>) for a handshake message, or an ordinary envelope (recipient/sender
-    /// paths resolved) for a user message -- see design.md "G2 staging" and "Decode order
+    /// <see langword="null"/>) for a handshake message, or an ordinary envelope (carrying its decoded
+    /// frame, whose path literals the dispatcher decodes on demand) for a user message -- see design.md "G2 staging" and "Decode order
     /// (structural, not an optimization)".
     ///
     /// <para>
@@ -76,9 +76,32 @@ namespace Akka.Remote.Artery
     /// <c>RemoteActorRefProvider.ResolveActorRefWithLocalAddress</c>, and the final
     /// <c>Tell</c> -- moves onto one of <see cref="InboundLanes"/> dedicated background consumer
     /// loops, each fed by its own bounded <see cref="Channel{T}"/> (capacity
-    /// <see cref="InboundLaneBufferSize"/>). A message's lane is a stable hash of its recipient path
-    /// (<c>Logic.LaneFor</c>) -- so all ordinary traffic to the SAME recipient stays on the SAME
-    /// lane and is delivered in send order, exactly like today's single-lane pipeline.
+    /// <see cref="InboundLaneBufferSize"/>). A message whose header carries both a sender and a
+    /// recipient id is laned by a mix of the two ids (<c>Association.SelectPairLane</c>);
+    /// any other message by a stable hash of its recipient path (<see cref="ArteryLaneHash"/>). So
+    /// all traffic of one sender-recipient pair stays on one lane and is delivered in send order,
+    /// while different senders to the same recipient may use different lanes.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>What the reader does and what the lane does.</b> The reader decodes no string: it frames
+    /// the bytes, decodes the fixed header, applies the control/origin/quarantine/blackhole
+    /// checks, rejects compressed or missing recipient tags, and hashes the recipient literal's raw
+    /// UTF-8 bytes (or mixes the header's two ref ids) to choose the lane. The lane that owns the recipient then decodes the manifest,
+    /// sender and recipient literals and deserializes the payload, so that decode cost sits on that
+    /// lane rather than on the reader. Without ref ids, the lane is always the one a hash of the
+    /// decoded recipient string would give (<see cref="ArteryLaneHash.FromUtf8"/>). A queued lane item retains its
+    /// entire frame body until it is processed (bounded by lanes x lane buffer size x maximum frame
+    /// length).
+    /// </para>
+    ///
+    /// <para>
+    /// Frames are dropped in every failure case, with these log differences from the inline
+    /// (lanes = 1) path: a malformed recipient literal is rejected on the reader; a malformed sender
+    /// literal is rejected on the lane (same warning); and a malformed manifest literal is only
+    /// evaluated after the origin, quarantine and blackhole checks, so from an unknown origin it
+    /// produces the rate-limited unknown-origin warning, and from a quarantined or blackholed
+    /// origin a debug log, instead of the transient-decode warning.
     /// </para>
     ///
     /// <para>
@@ -162,7 +185,7 @@ namespace Akka.Remote.Artery
         /// </param>
         /// <param name="dispatchOrdinary">
         /// Needed ONLY when <paramref name="inboundLanes"/> &gt; 1: invoked by each lane's consumer
-        /// loop, once per deserialized ordinary message, as <c>(message, senderPath, recipientPath)</c>
+        /// loop, once per deserialized ordinary message, as <c>(message, decoded frame, the lane's remote-sender cache)</c>
         /// -- mirrors <c>ArteryRemoting.DispatchOrdinaryMessage</c> exactly (the same resolve-and-Tell
         /// logic <c>ArteryRemoting.DispatchInbound</c> uses for the lanes=1/non-lane path).
         /// </param>
@@ -187,7 +210,7 @@ namespace Akka.Remote.Artery
             int inboundLanes = 1,
             int inboundLaneBufferSize = 0,
             IInboundContext? inboundContext = null,
-            Action<object, string?, string>? dispatchOrdinary = null,
+            Action<object, ArteryEnvelopeDecoded, ArteryRemoteSenderCache>? dispatchOrdinary = null,
             Action<int>? onLanesInitialized = null,
             SharedTestState? testState = null)
         {
@@ -227,7 +250,7 @@ namespace Akka.Remote.Artery
             // SerializerId-based check and ProcessFrameLaneMode's classification must be updated
             // together, or lane mode will silently stop treating IsControl the same way the
             // non-lane path does for the affected type.
-            if (inboundLanes > 1)
+            if (dispatchOrdinary is not null)
             {
                 ControlMessageSerializerId = serialization.FindSerializerForType(typeof(HandshakeReq))?.Identifier ?? int.MinValue;
                 SelectionMessageSerializerId = serialization.FindSerializerForType(typeof(ActorSelectionMessage))?.Identifier ?? int.MinValue;
@@ -266,7 +289,7 @@ namespace Akka.Remote.Artery
         public IInboundContext? InboundContext { get; }
 
         /// <summary>See the constructor parameter of the same name. <see langword="null"/> when <see cref="InboundLanes"/> is 1.</summary>
-        public Action<object, string?, string>? DispatchOrdinary { get; }
+        public Action<object, ArteryEnvelopeDecoded, ArteryRemoteSenderCache>? DispatchOrdinary { get; }
 
         /// <summary>See the constructor parameter of the same name.</summary>
         public Action<int>? OnLanesInitialized { get; }
@@ -312,33 +335,28 @@ namespace Akka.Remote.Artery
         protected override GraphStageLogic CreateLogic(Attributes inheritedAttributes) => new Logic(this);
 
         /// <summary>
-        /// One decoded-but-not-yet-deserialized ordinary message, handed from the fused
-        /// per-connection stage to a lane's consumer loop. Carries the RAW payload bytes (a
-        /// <see cref="ReadOnlySequence{T}"/> slice into a freshly-allocated, never-pooled,
-        /// never-mutated <c>byte[]</c> owned by that one TCP read -- see
-        /// <c>Akka.IO.TcpConnection.ReadPipeChunkAsync</c>, which copies OUT of the pipe's own
-        /// pooled segments before <c>AdvanceTo</c> for exactly this reason -- so it is always safe
-        /// to retain and deserialize later, on a different thread, with no risk of the underlying
-        /// bytes being reused/overwritten out from under the lane consumer) plus everything else
-        /// the lane needs to finish the job without going back to the connection: the serializer
-        /// id/manifest to deserialize with, and the already-resolved sender/recipient wire paths.
+        /// One ordinary message, handed from the fused per-connection stage to a lane's consumer
+        /// loop. It carries only the WHOLE frame body (envelope header, literals and payload): the
+        /// reader decodes no string, and the lane consumer re-decodes the header, resolves the
+        /// manifest/sender/recipient literals and deserializes the payload.
+        ///
+        /// <para>
+        /// Buffer lifetime: the frame body is a slice of freshly-allocated, never-pooled,
+        /// never-mutated <c>byte[]</c>s owned by the TCP reads (see
+        /// <c>Akka.IO.TcpConnection.PipeReadToActor.Read</c>, which copies OUT of the pipe's own
+        /// pooled segments before <c>AdvanceTo</c> for exactly this reason), and
+        /// <see cref="ArteryFrameParser"/> never copies or recycles them. It is therefore always safe
+        /// to retain and decode later, on a different thread.
+        /// </para>
         /// </summary>
         private readonly struct LaneWorkItem
         {
-            public LaneWorkItem(ReadOnlySequence<byte> payload, int serializerId, string manifest, string? senderPath, string recipientPath)
+            public LaneWorkItem(ReadOnlySequence<byte> frameBody)
             {
-                Payload = payload;
-                SerializerId = serializerId;
-                Manifest = manifest;
-                SenderPath = senderPath;
-                RecipientPath = recipientPath;
+                FrameBody = frameBody;
             }
 
-            public ReadOnlySequence<byte> Payload { get; }
-            public int SerializerId { get; }
-            public string Manifest { get; }
-            public string? SenderPath { get; }
-            public string RecipientPath { get; }
+            public ReadOnlySequence<byte> FrameBody { get; }
         }
 
         private sealed class Logic : GraphStageLogic, IInHandler, IOutHandler
@@ -389,6 +407,9 @@ namespace Akka.Remote.Artery
             /// touch this machinery" remarks.
             /// </summary>
             private bool _laneModeActive;
+
+            /// <summary>The remote-sender cache of <see cref="DispatchInline"/>; used only by this stage's thread.</summary>
+            private readonly ArteryRemoteSenderCache _inlineSenders = new();
 
             /// <summary>One bounded channel per lane; created once, lazily, by <see cref="InitLanes"/>.</summary>
             private Channel<LaneWorkItem>[]? _lanes;
@@ -457,6 +478,12 @@ namespace Akka.Remote.Artery
 
             public void OnPull()
             {
+                // Lane mode stops draining at a control frame until the stages below have handled
+                // it (see ProcessFrameLaneMode); this pull means they have, so resume with the
+                // frames that followed it.
+                if (_pending.Count == 0 && _laneModeActive && !_writeInFlight)
+                    DrainReadyFramesLaneMode();
+
                 if (_pending.Count > 0)
                 {
                     Push(_stage.Out, _pending.Dequeue());
@@ -479,12 +506,21 @@ namespace Akka.Remote.Artery
 
             public void OnUpstreamFinish()
             {
-                if (_pending.Count == 0 && !_writeInFlight)
+                if (NothingLeftToEmit)
                     CompleteInputStage();
 
-                // else: swallow the termination and let OnPull (non-lane path) / OnLaneWriteAvailable
-                // (lane path) drain the remainder, completing once both are empty/clear.
+                // else: swallow the termination and let OnPull (non-lane path, or lane mode behind a
+                // control frame) / OnLaneWriteAvailable (lane path) drain the remainder, completing
+                // once both are empty/clear.
             }
+
+            /// <summary>
+            /// No queued envelope, no item parked on a lane, and no control envelope still on its way
+            /// through the stages below -- lane mode resumes draining the frames behind one only on
+            /// the next <see cref="OnPull"/>.
+            /// </summary>
+            private bool NothingLeftToEmit =>
+                _pending.Count == 0 && !_writeInFlight && (!_laneModeActive || IsAvailable(_stage.Out));
 
             private void CompleteInputStage()
             {
@@ -566,14 +602,15 @@ namespace Akka.Remote.Artery
                     ? new ArteryFrameParser(_stage.MaxLargeFrameLength)
                     : new ArteryFrameParser(_stage.MaxFrameLength);
 
-                // GATE A: only an Ordinary-stream connection, and only when lanes are actually
-                // configured, ever enters lane mode -- every Control/Large connection, and EVERY
-                // connection at the InboundLanes=1 default, is untouched from here on (see the
-                // type-level remarks).
-                if (streamId == ArteryStreamId.Ordinary && _stage.InboundLanes > 1)
+                // GATE A: only an Ordinary-stream connection ever enters lane mode -- every
+                // Control/Large connection is untouched from here on (see the type-level remarks).
+                // With InboundLanes = 1 there are no lanes: the checked ordinary frames are
+                // dispatched inline (see DispatchInline).
+                if (streamId == ArteryStreamId.Ordinary && _stage.DispatchOrdinary is not null)
                 {
                     _laneModeActive = true;
-                    InitLanes();
+                    if (_stage.InboundLanes > 1)
+                        InitLanes();
                 }
 
                 _preambleParsed = true;
@@ -624,7 +661,7 @@ namespace Akka.Remote.Artery
             {
                 var decoded = ArteryEnvelopeCodec.Decode(frameBody);
 
-                if (!decoded.TryGetManifest(out var manifest))
+                if (!decoded.TryGetManifestBytes(out var manifest))
                 {
                     Log.Warning("Dropping inbound Artery frame: COMPRESSED manifest tag (ref/manifest compression is not implemented at G2).");
                     return null;
@@ -633,9 +670,14 @@ namespace Akka.Remote.Artery
                 var payload = _stage.Serialization.Deserialize(decoded.Payload, decoded.Header.SerializerId, manifest);
 
                 if (payload is IArteryControlMessage)
-                    return new InboundEnvelope(payload, null, null, decoded.Header.OriginUid, decoded.Header.SerializerId, manifest);
+                {
+                    // Control messages are rare and are not dispatched from their frame, so they keep the string.
+                    decoded.TryGetManifest(out var controlManifest);
+                    return new InboundEnvelope(payload, null, null, decoded.Header.OriginUid, decoded.Header.SerializerId, controlManifest);
+                }
 
-                if (!decoded.TryGetRecipientPath(out var recipientPath))
+                var recipientKind = decoded.RecipientKind;
+                if (recipientKind == ArteryTagKind.Compressed)
                 {
                     Log.Warning(
                         "Dropping inbound ordinary-stream message of type [{0}]: COMPRESSED recipient tag " +
@@ -643,15 +685,18 @@ namespace Akka.Remote.Artery
                     return null;
                 }
 
-                if (recipientPath is null)
+                if (recipientKind == ArteryTagKind.Absent)
                 {
                     Log.Warning(
                         "Dropping inbound ordinary-stream message of type [{0}] with no recipient.", payload.GetType());
                     return null;
                 }
 
-                var senderPath = decoded.TryGetSenderPath(out var s) ? s : null;
-                return new InboundEnvelope(payload, senderPath, recipientPath, decoded.Header.OriginUid, decoded.Header.SerializerId, manifest);
+                // The dispatcher decodes the sender and recipient literals, and only when needed.
+                return new InboundEnvelope(payload, null, null, decoded.Header.OriginUid, decoded.Header.SerializerId, string.Empty)
+                {
+                    Frame = decoded
+                };
             }
 
             private void DeliverOrPull()
@@ -682,6 +727,7 @@ namespace Akka.Remote.Artery
                 var laneCount = _stage.InboundLanes;
                 _laneLog = Log;
                 var lanes = new Channel<LaneWorkItem>[laneCount];
+                var onConsumerFailed = GetAsyncCallback<Exception>(FailStage);
 
                 for (var i = 0; i < laneCount; i++)
                 {
@@ -698,7 +744,10 @@ namespace Akka.Remote.Artery
                     var log = _laneLog;
                     var serialization = _stage.Serialization;
                     var dispatch = _stage.DispatchOrdinary!;
-                    _ = Task.Run(() => RunLaneConsumer(reader, serialization, dispatch, log));
+                    var senders = new ArteryRemoteSenderCache();
+                    // A consumer that ends abnormally would leave its lane unread: fail the stage so the connection restarts.
+                    Task.Run(() => RunLaneConsumer(reader, serialization, dispatch, senders, log))
+                        .ContinueWith(t => onConsumerFailed(t.Exception!.GetBaseException()), TaskContinuationOptions.OnlyOnFaulted);
                 }
 
                 _lanes = lanes;
@@ -707,6 +756,30 @@ namespace Akka.Remote.Artery
                 // null (the production default) does nothing.
                 _stage.OnLanesInitialized?.Invoke(laneCount);
             }
+
+            /// <summary>
+            /// Reads the next item, spinning briefly for one before giving up. Only reached after the
+            /// consumer has just processed an item: when it then parks, the reader's next write to this
+            /// lane has to wake it through the thread pool, a hand-off paid on the reader's thread.
+            /// </summary>
+            private static bool TryReadOrSpin(ChannelReader<LaneWorkItem> reader, out LaneWorkItem item)
+            {
+                if (reader.TryRead(out item))
+                    return true;
+
+                var spinner = new System.Threading.SpinWait();
+                for (var i = 0; i < LaneSpinIterations; i++)
+                {
+                    spinner.SpinOnce(sleep1Threshold: -1);
+                    if (reader.TryRead(out item))
+                        return true;
+                }
+
+                return false;
+            }
+
+            // Ten iterations stay within SpinWait's busy-spin phase (no yields): a few microseconds at most.
+            private const int LaneSpinIterations = 10;
 
             /// <summary>
             /// One lane's long-running consumer loop (design's benchmark-locked mechanism: one
@@ -724,34 +797,53 @@ namespace Akka.Remote.Artery
             private static async Task RunLaneConsumer(
                 ChannelReader<LaneWorkItem> reader,
                 Akka.Serialization.Serialization serialization,
-                Action<object, string?, string> dispatch,
+                Action<object, ArteryEnvelopeDecoded, ArteryRemoteSenderCache> dispatch,
+                ArteryRemoteSenderCache senders,
                 ILoggingAdapter log)
             {
                 try
                 {
                     while (await reader.WaitToReadAsync().ConfigureAwait(false))
                     {
-                        while (reader.TryRead(out var item))
+                        while (TryReadOrSpin(reader, out var item))
                         {
+                            // Decode on the lane: the reader left every literal undecoded. A
+                            // malformed literal (or any other decode error) drops only this item.
+                            // The dispatcher decodes the sender and recipient literals, and only
+                            // when needed.
+                            ArteryEnvelopeDecoded decoded;
+                            ReadOnlySequence<byte> manifest;
                             try
                             {
-                                var message = serialization.Deserialize(item.Payload, item.SerializerId, item.Manifest);
-                                dispatch(message, item.SenderPath, item.RecipientPath);
+                                decoded = ArteryEnvelopeCodec.Decode(item.FrameBody);
+                                decoded.TryGetManifestBytes(out manifest);
                             }
                             catch (Exception ex)
+                            {
+                                log.Warning(ex, "Transient error decoding an inbound Artery frame; connection remains live.");
+                                continue;
+                            }
+
+                            try
+                            {
+                                var message = serialization.Deserialize(decoded.Payload, decoded.Header.SerializerId, manifest);
+                                dispatch(message, decoded, senders);
+                            }
+                            catch (Exception ex) when (!Akka.IO.TlsCertificateSource.IsFatal(ex))
                             {
                                 log.Warning(
                                     ex,
                                     "Transient error deserializing/dispatching an inbound Artery lane message " +
                                     "(serializer id [{0}], manifest [{1}]); connection remains live.",
-                                    item.SerializerId, item.Manifest);
+                                    decoded.Header.SerializerId, Encoding.UTF8.GetString(in manifest));
                             }
                         }
                     }
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (!Akka.IO.TlsCertificateSource.IsFatal(ex))
                 {
                     log.Warning(ex, "Inbound Artery lane consumer loop terminated unexpectedly.");
+                    throw;
                 }
             }
 
@@ -774,16 +866,17 @@ namespace Akka.Remote.Artery
                     }
 
                     if (!handled)
-                        return; // parked -- stop draining further frames until lane capacity frees up.
+                        return; // parked on a lane, or a control frame must pass the stages below first.
                 }
             }
 
             /// <summary>
-            /// Decodes (never deserializes the application payload) one frame on an Ordinary-stream,
-            /// lane-enabled connection, then either (a) routes a genuine control-classified frame
-            /// (should never happen here -- defensive only, see the type-level remarks) through the
-            /// SAME inline path <see cref="DecodeFrame"/> uses, unchanged, or (b) hashes its
-            /// recipient (or, for a selection, its target path elements) to a lane and hands it off.
+            /// Decodes the header (no string and no application payload on the normal path) of one frame on an
+            /// Ordinary-stream, lane-enabled connection, then either (a) routes a genuine
+            /// control-classified frame (should never happen here -- defensive only, see the type-level
+            /// remarks) through the SAME inline path <see cref="DecodeFrame"/> uses, unchanged, or (b)
+            /// hashes its raw recipient bytes (or, for a selection, its target path elements) to a lane
+            /// and hands it off.
             /// Returns <see langword="false"/> only when (b) had to park on a full lane channel --
             /// the caller must stop draining further frames until that clears.
             /// </summary>
@@ -791,7 +884,9 @@ namespace Akka.Remote.Artery
             {
                 var decoded = ArteryEnvelopeCodec.Decode(frameBody);
 
-                if (!decoded.TryGetManifest(out var manifest))
+                // Resolve borrowed manifest bytes only on the thread that deserializes this frame.
+                var manifest = ReadOnlySequence<byte>.Empty;
+                if (decoded.ManifestKind == ArteryTagKind.Compressed)
                 {
                     Log.Warning("Dropping inbound Artery frame: COMPRESSED manifest tag (ref/manifest compression is not implemented at G2).");
                     return true;
@@ -803,9 +898,13 @@ namespace Akka.Remote.Artery
                     // connection (see the type-level remarks) -- deserialize INLINE exactly as the
                     // non-lane path does and push it through the ordinary Out pipeline so
                     // InboundHandshakeStage/SystemMessageAckerStage/DispatchInbound still see it.
+                    // Draining stops here until those stages have handled it, so a later frame of the
+                    // same read is checked only after, e.g., a handshake has registered its origin.
+                    decoded.TryGetManifestBytes(out manifest);
                     var controlPayload = _stage.Serialization.Deserialize(decoded.Payload, decoded.Header.SerializerId, manifest);
-                    _pending.Enqueue(new InboundEnvelope(controlPayload, null, null, decoded.Header.OriginUid, decoded.Header.SerializerId, manifest));
-                    return true;
+                    decoded.TryGetManifest(out var controlManifest);
+                    _pending.Enqueue(new InboundEnvelope(controlPayload, null, null, decoded.Header.OriginUid, decoded.Header.SerializerId, controlManifest));
+                    return false;
                 }
 
                 // Mirrors InboundHandshakeStage.IsKnownOrigin gating exactly (same shared-registry
@@ -832,6 +931,27 @@ namespace Akka.Remote.Artery
                     return true;
                 }
 
+                // advanced.test-mode failure injection for the lane path (lane-routed traffic
+                // bypasses the connection sink's InboundTestStage) -- the same known-origin
+                // blackhole check that stage performs, keyed identically as
+                // (localAddress, originAddress), and like that stage it runs before the quarantine
+                // check, so a blackholed origin gets no quarantine notice. Unknown origins never
+                // reach here (dropped by the IsKnownOrigin gate above, test-mode or not), so the
+                // InboundTestStage's pre-handshake HandshakeReq special case has no lane-path
+                // analog. See TestState's property remarks for the off-mode cost rationale.
+                if (_stage.TestState is { } testState)
+                {
+                    var origin = _stage.InboundContext!.TryResolveOriginAddress(decoded.Header.OriginUid);
+                    if (origin is not null &&
+                        testState.IsBlackhole(_stage.InboundContext!.LocalAddress.Address, origin))
+                    {
+                        Log.Debug(
+                            "dropping inbound lane-routed message from [{0}] with UID [{1}] because of blackhole",
+                            origin, decoded.Header.OriginUid);
+                        return true;
+                    }
+                }
+
                 // The quarantine check for the lane path. It does what InboundQuarantineCheckStage
                 // does, because lane traffic does not go through the sink that holds that stage.
                 // The checks from InboundHandshakeStage and InboundTestStage are inlined here for
@@ -848,6 +968,7 @@ namespace Akka.Remote.Artery
                     object quarantinedMessage;
                     try
                     {
+                        decoded.TryGetManifestBytes(out manifest);
                         quarantinedMessage = _stage.Serialization.Deserialize(decoded.Payload, decoded.Header.SerializerId, manifest);
                     }
                     catch (Exception ex)
@@ -876,27 +997,21 @@ namespace Akka.Remote.Artery
                     return true;
                 }
 
-                // advanced.test-mode failure injection for the lane path (lane-routed traffic
-                // bypasses the connection sink's InboundTestStage) -- the same known-origin
-                // blackhole check that stage performs, keyed identically as
-                // (localAddress, originAddress). Unknown origins never reach here (dropped by the
-                // IsKnownOrigin gate above, test-mode or not), so the InboundTestStage's
-                // pre-handshake HandshakeReq special case has no lane-path analog. See
-                // TestState's property remarks for the off-mode cost rationale.
-                if (_stage.TestState is { } testState)
-                {
-                    var origin = _stage.InboundContext!.TryResolveOriginAddress(decoded.Header.OriginUid);
-                    if (origin is not null &&
-                        testState.IsBlackhole(_stage.InboundContext!.LocalAddress.Address, origin))
-                    {
-                        Log.Debug(
-                            "dropping inbound lane-routed message from [{0}] with UID [{1}] because of blackhole",
-                            origin, decoded.Header.OriginUid);
-                        return true;
-                    }
-                }
+                return RouteByRecipientBytes(decoded, frameBody);
+            }
 
-                if (!decoded.TryGetRecipientPath(out var recipientPath))
+            /// <summary>
+            /// Routes by the raw recipient bytes. Checks the recipient tag, validates the recipient literal's
+            /// bounds, hashes its raw UTF-8 bytes to a lane without creating a string, and hands the
+            /// whole frame body to the lane. A malformed recipient literal throws
+            /// <see cref="ArteryEnvelopeException"/>, which the drain loop logs and treats as a drop
+            /// of this one frame. The manifest and sender literals are validated when the lane
+            /// decodes them.
+            /// </summary>
+            private bool RouteByRecipientBytes(in ArteryEnvelopeDecoded decoded, ReadOnlySequence<byte> frameBody)
+            {
+                var recipientKind = decoded.RecipientKind;
+                if (recipientKind == ArteryTagKind.Compressed)
                 {
                     Log.Warning(
                         "Dropping inbound ordinary-stream message (serializer id [{0}]): COMPRESSED recipient tag " +
@@ -904,23 +1019,51 @@ namespace Akka.Remote.Artery
                     return true;
                 }
 
-                if (recipientPath is null)
+                if (recipientKind == ArteryTagKind.Absent)
                 {
                     Log.Warning("Dropping inbound ordinary-stream message (serializer id [{0}]) with no recipient.", decoded.Header.SerializerId);
                     return true;
                 }
 
-                var senderPath = decoded.TryGetSenderPath(out var s) ? s : null;
+                if (_lanes is null)
+                    return DispatchInline(decoded);
 
-                // ActorSelectionMessage special case -- see the type-level "ActorSelectionMessage
-                // lane key" remarks.
-                var laneKey = decoded.Header.SerializerId == _stage.SelectionMessageSerializerId
-                    ? BuildSelectionLaneKey(decoded.Payload) ?? recipientPath
-                    : recipientPath;
+                var recipientBytes = decoded.GetRecipientLiteralBytes();
 
-                var laneIndex = LaneFor(laneKey, _stage.InboundLanes);
+                // Lane choice. ActorSelectionMessage keeps its string key (BuildSelectionLaneKey + char
+                // hash); a message with both a sender and a recipient id takes its pair's lane; anything
+                // else hashes the recipient literal's raw bytes. All are pure functions of the frame
+                // contents, so a given sender-recipient pair always maps to one lane.
+                var laneIndex = -1;
+                if (decoded.Header.SerializerId == _stage.SelectionMessageSerializerId)
+                {
+                    var selectionKey = BuildSelectionLaneKey(decoded.Payload);
+                    if (selectionKey is not null)
+                        laneIndex = LaneFor(selectionKey, _stage.InboundLanes);
+                }
 
-                return TryRouteToLane(laneIndex, new LaneWorkItem(decoded.Payload, decoded.Header.SerializerId, manifest, senderPath, recipientPath));
+                if (laneIndex < 0)
+                {
+                    var header = decoded.Header;
+                    laneIndex = header.SenderId != 0 && header.RecipientId != 0
+                        ? Association.SelectPairLane(header.SenderId, header.RecipientId, _stage.InboundLanes)
+                        : ArteryLaneHash.FromUtf8(recipientBytes, _stage.InboundLanes);
+                }
+
+                return TryRouteToLane(laneIndex, new LaneWorkItem(frameBody));
+            }
+
+            /// <summary>
+            /// InboundLanes = 1: deserializes and dispatches a checked ordinary frame right here, on
+            /// this stage's own thread, as a lane consumer would. A deserialization failure throws
+            /// to the drain loop, which logs it and drops only this frame.
+            /// </summary>
+            private bool DispatchInline(in ArteryEnvelopeDecoded decoded)
+            {
+                decoded.TryGetManifestBytes(out var manifest);
+                var message = _stage.Serialization.Deserialize(decoded.Payload, decoded.Header.SerializerId, manifest);
+                _stage.DispatchOrdinary!(message, decoded, _inlineSenders);
+                return true;
             }
 
             /// <summary>
@@ -960,20 +1103,7 @@ namespace Akka.Remote.Artery
             /// deliberately avoids the classic <c>Math.Abs(int.MinValue)</c> overflow trap (which
             /// returns <see cref="int.MinValue"/> unchanged, still negative).
             /// </summary>
-            private static int LaneFor(string key, int lanes)
-            {
-                const uint offsetBasis = 2166136261;
-                const uint prime = 16777619;
-
-                var hash = offsetBasis;
-                foreach (var c in key)
-                {
-                    hash ^= c;
-                    hash *= prime;
-                }
-
-                return (int)(hash % (uint)lanes);
-            }
+            private static int LaneFor(string key, int lanes) => ArteryLaneHash.FromChars(key, lanes);
 
             /// <summary>
             /// Attempts to hand <paramref name="item"/> to lane <paramref name="laneIndex"/>'s
@@ -1039,11 +1169,83 @@ namespace Akka.Remote.Artery
                 DrainReadyFramesLaneMode();
                 DeliverOrPull();
 
-                if (_pending.Count == 0 && !_writeInFlight && IsClosed(_stage.In))
+                if (NothingLeftToEmit && IsClosed(_stage.In))
                     CompleteInputStage();
             }
 
             #endregion
+        }
+    }
+
+    /// <summary>
+    /// INTERNAL API. FNV-1a lane hashing for inbound lane routing.
+    /// </summary>
+    internal static class ArteryLaneHash
+    {
+        private const uint OffsetBasis = 2166136261;
+        private const uint Prime = 16777619;
+
+        /// <summary>
+        /// FNV-1a over the chars of <paramref name="key"/>, unsigned-mod'd into <c>[0, lanes)</c>.
+        /// Unsigned mod avoids the <c>Math.Abs(int.MinValue)</c> overflow trap.
+        /// </summary>
+        public static int FromChars(string key, int lanes)
+        {
+            var hash = OffsetBasis;
+            foreach (var c in key)
+            {
+                hash ^= c;
+                hash *= Prime;
+            }
+
+            return (int)(hash % (uint)lanes);
+        }
+
+        /// <summary>
+        /// The lane for a recipient literal, computed from its raw UTF-8 bytes. The lane is always the
+        /// one <see cref="FromChars"/> would give for <c>Encoding.UTF8.GetString(bytes)</c>, so the
+        /// lane key is identical to hashing the decoded string for every input. Pure-ASCII bytes
+        /// (every valid actor path) are hashed in one pass with the same FNV-1a constants and no
+        /// string is created, because each ASCII byte equals its char. On the first byte >= 0x80 the
+        /// literal takes a slow path: it is decoded with the same replacement-fallback decoder and the
+        /// chars are hashed, which keeps byte strings that decode to the same string (for example a
+        /// trailing 0x80 and 0x81) on one lane.
+        /// </summary>
+        public static int FromUtf8(in ReadOnlySequence<byte> utf8, int lanes)
+        {
+            var hash = OffsetBasis;
+            if (utf8.IsSingleSegment)
+            {
+                if (!TryMixAscii(ref hash, utf8.First.Span))
+                    return FromChars(Encoding.UTF8.GetString(utf8.ToArray()), lanes);
+            }
+            else
+            {
+                foreach (var segment in utf8)
+                {
+                    if (!TryMixAscii(ref hash, segment.Span))
+                        return FromChars(Encoding.UTF8.GetString(utf8.ToArray()), lanes);
+                }
+            }
+
+            return (int)(hash % (uint)lanes);
+        }
+
+        private static bool TryMixAscii(ref uint hash, ReadOnlySpan<byte> bytes)
+        {
+            var h = hash;
+            for (var i = 0; i < bytes.Length; i++)
+            {
+                var b = bytes[i];
+                if (b >= 0x80)
+                    return false;
+
+                h ^= b;
+                h *= Prime;
+            }
+
+            hash = h;
+            return true;
         }
     }
 }

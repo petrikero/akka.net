@@ -398,7 +398,10 @@ namespace Akka.Dispatch
 
         private void ProcessMailbox()
         {
-            ProcessMailbox(Math.Max(1, Dispatcher.Throughput), Dispatcher.ThroughputDeadlineTime ?? 0L);
+            // ThroughputDeadlineTime is a duration; convert it to an absolute deadline once per run (0 = no deadline)
+            var deadlineTime = Dispatcher.ThroughputDeadlineTime ?? 0L;
+            ProcessMailbox(Math.Max(1, Dispatcher.Throughput),
+                deadlineTime > 0 ? MonotonicClock.GetTicks() + deadlineTime : 0L);
         }
 
         private void ProcessMailbox(int left, long deadlineTicks)
@@ -412,7 +415,7 @@ namespace Akka.Dispatch
                 // not going to bother catching ThreadAbortExceptions here, since they'll get rethrown anyway
                 Actor.Invoke(next);
                 ProcessAllSystemMessages();
-                if (left > 0 && (Dispatcher.ThroughputDeadlineTime.HasValue == false ||
+                if (left > 0 && (deadlineTicks == 0L ||
                                  (MonotonicClock.GetTicks() - deadlineTicks) < 0))
                 {
                     left = left - 1;
@@ -432,6 +435,10 @@ namespace Akka.Dispatch
         /// </summary>
         private void ProcessAllSystemMessages()
         {
+            // common case: nothing queued, so avoid the interlocked exchange in SystemDrain
+            if (_systemQueueDoNotCallMeDirectly == null)
+                return;
+
             Exception interruption = null;
             var messageList = SystemDrain(SystemMessageList.LNil);
             while (messageList.NonEmpty && !IsClosed())
