@@ -42,6 +42,13 @@ namespace Akka.Remote.Artery
         string? SenderPath { get; }
 
         /// <summary>
+        /// The sender's path, when the encoder formats the sender literal from it straight into the frame
+        /// (with the transport's own address standing in for a local address) instead of from
+        /// <see cref="SenderPath"/>. At most one of the two is set.
+        /// </summary>
+        Akka.Actor.ActorPath? SenderActorPath { get; }
+
+        /// <summary>
         /// The recipient's wire-format path, or <see langword="null"/> for control messages (which
         /// are recognized by serializer id/manifest on decode, not by recipient).
         /// </summary>
@@ -53,6 +60,18 @@ namespace Akka.Remote.Artery
         /// this instead of re-running an <c>is</c> type-test on every element at every stage.
         /// </summary>
         bool IsControl { get; }
+
+        /// <summary>The sender ref's numeric id written into the envelope header, or 0 for none.</summary>
+        long SenderId { get; }
+
+        /// <summary>The recipient ref's numeric id written into the envelope header, or 0 for none.</summary>
+        long RecipientId { get; }
+
+        /// <summary>
+        /// The recipient path already encoded as UTF-8, written instead of <see cref="RecipientPath"/>
+        /// when set (an ordinary message to a remote ref, which keeps its serialized path).
+        /// </summary>
+        byte[]? RecipientPathUtf8 { get; }
     }
 
     /// <summary>
@@ -66,9 +85,47 @@ namespace Akka.Remote.Artery
     /// <param name="Message">The message to serialize as the envelope's payload.</param>
     /// <param name="SenderPath">The sender's wire-format path, or <see langword="null"/> for no sender.</param>
     /// <param name="RecipientPath">The recipient's wire-format path, or <see langword="null"/> for control messages.</param>
-    internal sealed record OutboundEnvelope(object Message, string? SenderPath, string? RecipientPath) : IOutboundEnvelope
+    /// <param name="SenderId">The sender ref's numeric id (see <see cref="ArteryEnvelopeFixedHeader.SenderId"/>), or 0.</param>
+    /// <param name="RecipientId">The recipient ref's numeric id (see <see cref="ArteryEnvelopeFixedHeader.RecipientId"/>), or 0.</param>
+    internal sealed record OutboundEnvelope(object Message, string? SenderPath, string? RecipientPath, long SenderId = 0, long RecipientId = 0) : IOutboundEnvelope
     {
+        // One field holds the recipient as either its path string or its UTF-8 bytes. A send sets one of
+        // the two; if both are set, the UTF-8 bytes win (the encoder prefers them anyway).
+        // NOTE: once this project targets .NET 11, replace this object-typed field with a union of
+        // string and byte[] so the two cases are expressed in the type instead of by type tests.
+        private object? _recipient = RecipientPath;
+
+        // Likewise one field holds the sender as either its path string or its ActorPath; the encoder
+        // formats an ActorPath into the frame, so an ordinary send builds no sender path string.
+        private object? _sender = SenderPath;
+
+        public string? SenderPath { get => _sender as string; init => _sender = value; }
+
+        public Akka.Actor.ActorPath? SenderActorPath
+        {
+            get => _sender as Akka.Actor.ActorPath;
+            init
+            {
+                if (value is not null)
+                    _sender = value;
+            }
+        }
+
         /// <inheritdoc/>
-        public bool IsControl { get; } = Message is IArteryControlMessage;
+        public string? RecipientPath { get => _recipient as string; init => _recipient = value; }
+
+        /// <inheritdoc/>
+        public bool IsControl => Message is IArteryControlMessage;
+
+        /// <inheritdoc/>
+        public byte[]? RecipientPathUtf8
+        {
+            get => _recipient as byte[];
+            init
+            {
+                if (value is not null)
+                    _recipient = value;
+            }
+        }
     }
 }

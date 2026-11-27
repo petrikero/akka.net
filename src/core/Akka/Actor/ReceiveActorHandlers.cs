@@ -102,12 +102,12 @@ internal sealed class ReceiveActorHandlers
 
     public bool TryHandle(object message)
     {
-        var messageType = message.GetType();
+        // Each handler tests the message's type itself: a cast check for a generic handler instead of
+        // Type.IsAssignableFrom, which gives the same answer.
         if (TypedHandlers.Count <= MaxHandlersWithoutCache)
         {
             foreach (var handler in TypedHandlers)
             {
-                if (!handler.TargetType.IsAssignableFrom(messageType)) continue;
                 if (handler.TryHandle(message))
                 {
                     return true;
@@ -116,6 +116,7 @@ internal sealed class ReceiveActorHandlers
         }
         else
         {
+            var messageType = message.GetType();
             _handlersByType ??= new Dictionary<Type, ITypeHandler[]>();
             if (!_handlersByType.TryGetValue(messageType, out var candidates))
             {
@@ -142,7 +143,8 @@ internal sealed class ReceiveActorHandlers
 internal interface ITypeHandler
 {
     Type TargetType { get; }
-    
+
+    /// <summary>False when the message is not of <see cref="TargetType"/> or was not handled.</summary>
     bool TryHandle(object message);
 }
 
@@ -161,7 +163,7 @@ internal sealed class WeaklyTypedPredicateHandler : ITypeHandler
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryHandle(object message)
     {
-        return Predicate(message) && Handler(message);
+        return TargetType.IsAssignableFrom(message.GetType()) && Predicate(message) && Handler(message);
     }
 
     public Type TargetType { get; }
@@ -182,7 +184,7 @@ internal sealed class WeaklyTypedHandler : ITypeHandler
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryHandle(object message)
     {
-        return Handler(message);
+        return TargetType.IsAssignableFrom(message.GetType()) && Handler(message);
     }
 }
 
@@ -202,8 +204,7 @@ internal sealed class TypeHandler<T> : ITypeHandler
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryHandle(object message)
     {
-        var typedMessage = (T)message;
-        return Handler(typedMessage);
+        return message is T typedMessage && Handler(typedMessage);
     }
 }
 
@@ -222,8 +223,7 @@ internal sealed class PredicateHandler<T> : ITypeHandler
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryHandle(object typedMessage)
     {
-        var message = (T)typedMessage;
-        return Predicate(message) && Handler(message);
+        return typedMessage is T message && Predicate(message) && Handler(message);
     }
 
     public Type TargetType { get; }
