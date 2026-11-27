@@ -197,6 +197,13 @@ namespace Akka.IO
             private FlushCompleted() { }
         }
 
+        /// <summary>Self-tell: flush the unacked writes enqueued before it, so a burst of them shares one flush.</summary>
+        private sealed class FlushNow : INoSerializationVerificationNeeded, IDeadLetterSuppression
+        {
+            public static readonly FlushNow Instance = new();
+            private FlushNow() { }
+        }
+
         /// <summary>
         /// Self-tell: the output pipe's pending flush failed or found the output closed.
         /// </summary>
@@ -280,6 +287,7 @@ namespace Akka.IO
         // oldest _flushCovers of them; the rest go out on the next flush.
         private readonly Queue<WriteCommand> _pendingAcks = new();
         private bool _flushPending;
+        private bool _flushScheduled; // a FlushNow is in our own mailbox
         private int _flushCovers;
 
         #region Connection state flags
@@ -302,6 +310,7 @@ namespace Akka.IO
         // We've initiated a graceful close (HandleClose has run). Used to fast-fail
         // any further Tcp.Write commands with DroppingWriteBecauseClosingException.
         private bool _closingGracefully;
+        private bool _transportCloseStarted; // TryStartTransportClose has started CloseAsync/ShutdownAsync
 
         // The pipe-reader pump task observed completion (EOF or error). Read path
         // gates on this together with _outputShutdown to know when TryFinishClose
@@ -602,7 +611,7 @@ namespace Akka.IO
         {
             var s = options.OfType<Inet.SO.PipeBufferSize>().LastOrDefault()?.Size ?? 32 * 1024;
             return new PipeOptions(pauseWriterThreshold: s * 2L, resumeWriterThreshold: s,
-                minimumSegmentSize: settings.MaxFrameSizeBytes, useSynchronizationContext: false);
+                minimumSegmentSize: settings.MaxFrameSizeBytes, readerScheduler: PipeScheduler.Inline, writerScheduler: PipeScheduler.Inline, useSynchronizationContext: false);
         }
 
         /* ================================================================= */
@@ -645,12 +654,17 @@ namespace Akka.IO
                     AllowReading();
                 }
 
-                // Replay writes buffered before Register through the normal write path, in order.
+                // Replay writes buffered before Register through the normal write path, in order, and flush
+                // once after the last so they leave in one socket send.
+                var wantsAck = false;
                 while (_pendingRegistrationWrites.Count > 0)
                 {
                     var (cmd, sender) = _pendingRegistrationWrites.Dequeue();
-                    EnqueueWrite(cmd, sender);
+                    if (AppendWrite(cmd, sender))
+                        wantsAck |= cmd.WantsAck;
                 }
+
+                FlushAppended(wantsAck);
 
                 Become(OpenBehaviour);
             });
@@ -679,6 +693,7 @@ namespace Akka.IO
             Receive<IoTaskFailed>(msg => HandleIoError(msg.Cause));
             Receive<WritePumpFailed>(msg => HandleIoError(msg.Cause));
             Receive<FlushCompleted>(_ => OnFlushCompleted());
+            Receive<FlushNow>(_ => OnFlushNow());
             Receive<FlushFailed>(HandleFlushFailed);
             Receive<HandlerDied>(_ =>
             {
@@ -705,6 +720,7 @@ namespace Akka.IO
             Receive<IoTaskFailed>(msg => HandleIoError(msg.Cause));
             Receive<WritePumpFailed>(msg => HandleIoError(msg.Cause));
             Receive<FlushCompleted>(_ => OnFlushCompleted());
+            Receive<FlushNow>(_ => OnFlushNow());
             Receive<FlushFailed>(HandleFlushFailed);
             Receive<HandlerDied>(_ =>
             {
@@ -825,6 +841,11 @@ namespace Akka.IO
             Receive<FlushCompleted>(_ =>
             {
                 OnFlushCompleted();
+                TryStartTransportClose(closeEvent);
+            });
+            Receive<FlushNow>(_ =>
+            {
+                OnFlushNow();
                 TryStartTransportClose(closeEvent);
             });
             Receive<FlushFailed>(msg =>
@@ -1196,11 +1217,14 @@ namespace Akka.IO
                     EnqueueWrite(w, Sender);
                     break;
                 case CompoundWrite compounds:
+                    // Flush once after the last part, so the parts leave in one socket send.
+                    var wantsAck = false;
                     foreach (var c in compounds)
                     {
                         if (c is Write w2)
                         {
-                            EnqueueWrite(w2, Sender);
+                            if (AppendWrite(w2, Sender))
+                                wantsAck |= w2.WantsAck;
                         }
                         else
                         {
@@ -1208,6 +1232,8 @@ namespace Akka.IO
                                 new InvalidOperationException($"Cannot enqueue {c} - only valid classes are Write and CompoundWrite")));
                         }
                     }
+
+                    FlushAppended(wantsAck);
                     break;
                 default:
                     Sender.Tell(cmd.FailureMessage.WithCause(
@@ -1287,6 +1313,16 @@ namespace Akka.IO
 
         private void EnqueueWrite(Write write, IActorRef sender)
         {
+            if (AppendWrite(write, sender))
+                FlushAppended(write.WantsAck);
+        }
+
+        /// <summary>
+        /// Puts the write's bytes in the output pipe and owes its ack, without flushing. Returns false when the
+        /// write was rejected or failed instead. Callers appending several writes flush once after the last.
+        /// </summary>
+        private bool AppendWrite(Write write, IActorRef sender)
+        {
             // write-commands-queue-max-size caps a single write. Backpressure comes from StartFlush
             // holding back acks while the output pipe is over its pause threshold.
             if (_maxQueuedBytes >= 0 && write.Bytes > _maxQueuedBytes)
@@ -1295,7 +1331,7 @@ namespace Akka.IO
                 // reaches the pipe, so dispose any owner(s) it carries before signaling failure.
                 write.Data.DisposeOwnedSegments();
                 sender.Tell(write.FailureMessage.WithCause(DroppingWriteBecauseQueueIsFullException));
-                return;
+                return false;
             }
 
             if (write.Bytes > 0)
@@ -1311,7 +1347,7 @@ namespace Akka.IO
                     write.Data.DisposeOwnedSegments();
                     _pendingAcks.Enqueue(new WriteCommand(write, sender));
                     HandleFlushFailed(new FlushFailed(ex));
-                    return;
+                    return false;
                 }
             }
 
@@ -1321,9 +1357,27 @@ namespace Akka.IO
 
             // Keep FIFO order: an empty write still waits its turn behind whatever is already owed.
             _pendingAcks.Enqueue(new WriteCommand(write, sender));
+            return true;
+        }
 
-            if (!_flushPending)
+        /// <summary>
+        /// Flushes what <see cref="AppendWrite"/> appended, if anything is owed. <paramref name="wantsAck"/> is true
+        /// when any of those writes wants an ack.
+        /// </summary>
+        private void FlushAppended(bool wantsAck)
+        {
+            // A write with an ack flushes now, so its ack reports its own flush (backpressure). So does a write
+            // with nothing queued behind it. Otherwise the flush waits behind the mailbox (FlushNow), so a burst
+            // of unacked writes shares one socket send.
+            if (_flushPending || _pendingAcks.Count == 0)
+                return;
+            if (wantsAck || ((ActorCell)Context).Mailbox?.HasMessages != true)
                 StartFlush();
+            else if (!_flushScheduled)
+            {
+                _flushScheduled = true;
+                Self.Tell(FlushNow.Instance);
+            }
         }
 
         /// <summary>
@@ -1410,6 +1464,13 @@ namespace Akka.IO
             HandleIoError(msg.Cause);
         }
 
+        private void OnFlushNow()
+        {
+            _flushScheduled = false;
+            if (!_flushPending && _pendingAcks.Count > 0)
+                StartFlush();
+        }
+
         private void OnFlushCompleted()
         {
             _flushPending = false;
@@ -1458,13 +1519,14 @@ namespace Akka.IO
         /// <summary>
         /// Starts the transport's CloseAsync (ShutdownAsync for ConfirmedClose) once every queued
         /// write is in the output pipe, since both complete the pipe. ClosingBehaviour calls this
-        /// on entry and after each FlushCompleted.
+        /// on entry and after each FlushCompleted or FlushNow, and it starts the operation at most once.
         /// </summary>
         private void TryStartTransportClose(ConnectionClosed closeEvent)
         {
-            if (_transport == null || _flushPending || _pendingAcks.Count > 0)
+            if (_transport == null || _transportCloseStarted || _flushPending || _pendingAcks.Count > 0)
                 return;
 
+            _transportCloseStarted = true;
             var operation = closeEvent is ConfirmedClosed ? _transport.ShutdownAsync() : _transport.CloseAsync();
             operation.ContinueWith(t =>
             {
